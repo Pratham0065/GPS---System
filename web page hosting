@@ -7,3 +7,9 @@ eg: http://10.186.243.176:5000/
 for android:
 http://{your IPv4 address}:5000/sender
 eg: http://10.186.243.176:5000/sender
+
+
+if http is no working, try this:
+open chrome, search for "chrome://flags/#unsafely-treat-insecure-origin-as-secure"
+enable it and paste the link here.
+relaunch it and try again.
