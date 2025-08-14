@@ -1,0 +1,9 @@
+open these codes on any browser.
+
+for desktop:
+http://{your IPv4 address}:5000/ 
+eg: http://10.186.243.176:5000/
+
+for android:
+http://{your IPv4 address}:5000/sender
+eg: http://10.186.243.176:5000/sender
