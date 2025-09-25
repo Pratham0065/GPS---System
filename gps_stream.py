@@ -1,0 +1,135 @@
+import os
+from datetime import datetime
+from flask import Flask, Response
+from flask_socketio import SocketIO, emit
+
+app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*")
+latest_locations = {}  # device_id -> payload
+
+# ---------- Inline HTML pages so you only need ONE file ----------
+SENDER_HTML = r"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>GPS Sender</title>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
+<style>
+body{font-family:system-ui,Arial,sans-serif;margin:16px}.wrap{max-width:560px;margin:auto}
+.card{border:1px solid #ddd;border-radius:12px;padding:16px}.row{display:flex;gap:8px;align-items:center;margin-bottom:12px}
+input{padding:8px;border-radius:8px;border:1px solid #ccc;width:100%}button{padding:10px 14px;border-radius:10px;border:1px solid #999;background:#f7f7f7;cursor:pointer}
+.ok{color:#0a7}.warn{color:#d70}.err{color:#c00}.mono{font-family:ui-monospace,Menlo,Consolas,monospace}
+</style></head>
+<body>
+<div class="wrap">
+  <h2>Phone GPS → Server</h2>
+  <div class="card">
+    <div class="row">
+      <label for="device">Device ID</label>
+      <input id="device" placeholder="e.g. tony-phone" />
+    </div>
+    <div class="row">
+      <button id="start">Start Streaming</button>
+      <button id="stop" disabled>Stop</button>
+    </div>
+    <div id="status" class="mono warn">Idle</div>
+    <pre id="out" class="mono"></pre>
+  </div>
+  <p class="warn">Tip: allow Precise location and disable battery optimization for your browser.</p>
+</div>
+<script>
+const deviceInput=document.getElementById("device");
+deviceInput.value=localStorage.getItem("gps_device_id")||("device-"+Math.random().toString(36).slice(2,8));
+deviceInput.addEventListener("change",()=>localStorage.setItem("gps_device_id",deviceInput.value.trim()));
+const startBtn=document.getElementById("start"),stopBtn=document.getElementById("stop"),statusEl=document.getElementById("status"),outEl=document.getElementById("out");
+let watchId=null,socket=null;
+function log(s){outEl.textContent=(s+"\n"+outEl.textContent).slice(0,4000)}
+function setStatus(t,c=""){statusEl.className="mono "+c;statusEl.textContent=t}
+function start(){
+  const device_id=(deviceInput.value||"").trim(); if(!device_id){alert("Enter a Device ID");return}
+  localStorage.setItem("gps_device_id",device_id);
+  socket=io({transports:["websocket","polling"]});
+  socket.on("connect",()=>setStatus("Connected. Waiting for GPS…","ok"));
+  socket.on("connect_error",e=>setStatus("Socket error: "+e.message,"err"));
+  if(!("geolocation" in navigator)){setStatus("Geolocation not supported","err");return}
+  const options={enableHighAccuracy:true,maximumAge:1000,timeout:10000};
+  watchId=navigator.geolocation.watchPosition(pos=>{
+      const {latitude,longitude,accuracy,speed,heading}=pos.coords||{};
+      const payload={device_id,lat:latitude,lon:longitude,accuracy,speed,heading,timestamp:new Date().toISOString()};
+      if(socket&&socket.connected){socket.emit("location_push",payload);setStatus(`Streaming: ${latitude?.toFixed(6)}, ${longitude?.toFixed(6)} ±${Math.round(accuracy||0)}m`,"ok")}
+      else setStatus("Socket disconnected; retrying…","warn");
+      log(JSON.stringify(payload));
+    },
+    err=>{setStatus(`GPS error: ${err.code} ${err.message}`,"err");log("GPS error: "+err.message)},
+    options
+  );
+  startBtn.disabled=true; stopBtn.disabled=false;
+}
+function stop(){
+  if(watchId!==null){navigator.geolocation.clearWatch(watchId);watchId=null}
+  if(socket){socket.disconnect();socket=null}
+  setStatus("Stopped","warn"); startBtn.disabled=false; stopBtn.disabled=true;
+}
+startBtn.addEventListener("click",start); stopBtn.addEventListener("click",stop); window.addEventListener("beforeunload",stop);
+</script>
+</body></html>"""
+
+DASHBOARD_HTML = r"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>GPS Dashboard</title>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+body{margin:0;font-family:system-ui,Arial,sans-serif}
+header{padding:12px 16px;border-bottom:1px solid #eee;display:flex;align-items:center;justify-content:space-between}
+#map{height:calc(100vh - 56px);width:100vw}.pill{padding:6px 10px;border:1px solid #ddd;border-radius:999px;margin-left:8px}
+#log{position:absolute;right:16px;bottom:16px;background:rgba(255,255,255,.9);border:1px solid #ddd;border-radius:10px;padding:10px;max-width:40vw;max-height:30vh;overflow:auto;font-size:12px}
+</style></head>
+<body>
+<header>
+  <div>GPS Dashboard</div>
+  <div><span id="status" class="pill">Connecting…</span><span class="pill">Click marker → details</span></div>
+</header>
+<div id="map"></div><pre id="log"></pre>
+<script>
+const logEl=document.getElementById("log"); function log(s){logEl.textContent=(s+"\n"+logEl.textContent).slice(0,5000)}
+const map=L.map('map').setView([20.5937,78.9629],5);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; OpenStreetMap contributors'}).addTo(map);
+const markers=new Map();
+function upsertMarker({device_id,lat,lon,accuracy,speed,heading,timestamp}){
+  const key=device_id||"unknown"; const pos=[lat,lon];
+  if(!markers.has(key)){const marker=L.marker(pos).addTo(map); const circle=L.circle(pos,{radius:accuracy||0}).addTo(map); markers.set(key,{marker,circle}); marker.bindPopup(""); map.flyTo(pos,15,{duration:0.5})}
+  const {marker,circle}=markers.get(key); marker.setLatLng(pos); circle.setLatLng(pos); if(accuracy) circle.setRadius(accuracy);
+  const spd=(speed==null?"n/a":`${(speed*3.6).toFixed(1)} km/h`), hdg=(heading==null?"n/a":`${Math.round(heading)}°`);
+  marker.setPopupContent(`<b>${key}</b><br/>Lat: ${lat.toFixed(6)}, Lon: ${lon.toFixed(6)}<br/>Accuracy: ${Math.round(accuracy||0)} m<br/>Speed: ${spd}<br/>Heading: ${hdg}<br/>Time: ${timestamp||""}`);
+}
+const socket=io({transports:["websocket","polling"]}), statusEl=document.getElementById("status");
+socket.on("connect",()=>{statusEl.textContent="Connected";statusEl.style.borderColor="#0a7";statusEl.style.color="#0a7";socket.emit("request_snapshot",{})});
+socket.on("disconnect",()=>{statusEl.textContent="Disconnected";statusEl.style.borderColor="#c00";statusEl.style.color="#c00"});
+socket.on("location_update",msg=>{log(JSON.stringify(msg)); if(typeof msg.lat==="number"&&typeof msg.lon==="number") upsertMarker(msg)});
+</script>
+</body></html>"""
+
+# ---------- Routes ----------
+@app.get("/")
+def dashboard():
+    return Response(DASHBOARD_HTML, mimetype="text/html")
+
+@app.get("/sender")
+def sender():
+    return Response(SENDER_HTML, mimetype="text/html")
+
+@socketio.on("location_push")
+def handle_location_push(msg):
+    device_id = msg.get("device_id", "unknown")
+    msg["timestamp"] = msg.get("timestamp") or datetime.utcnow().isoformat()+"Z"
+    latest_locations[device_id] = msg
+    emit("location_update", msg, broadcast=True)
+
+@socketio.on("request_snapshot")
+def send_snapshot(_msg):
+    for payload in latest_locations.values():
+        emit("location_update", payload)
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "5000"))
+    socketio.run(app, host="0.0.0.0", port=port)  # Ctrl+C to stop
